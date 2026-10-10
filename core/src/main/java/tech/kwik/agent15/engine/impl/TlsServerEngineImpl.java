@@ -32,9 +32,11 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.security.MessageDigest;
 import java.security.PrivateKey;
+import java.security.PublicKey;
 import java.security.cert.X509Certificate;
 import java.util.*;
 import java.util.function.Function;
+import java.util.function.Predicate;
 import java.util.stream.Collectors;
 
 import static tech.kwik.agent15.TlsConstants.CipherSuite.TLS_AES_128_GCM_SHA256;
@@ -48,6 +50,8 @@ public class TlsServerEngineImpl extends TlsEngineImpl implements TlsServerEngin
         ReceivedClientHello,
         SentHelloRetryRequest,
         Negotiated,
+        WaitClientCertificate,
+        WaitClientCertificateVerify,
         WaitFinished,
         Connected
     }
@@ -77,6 +81,12 @@ public class TlsServerEngineImpl extends TlsEngineImpl implements TlsServerEngin
     private Long maxEarlyDataSize = 0xffffffffL;  // Simply use max.
     private byte[] additionalSessionData;
     private Function<ByteBuffer, Boolean> sessionDataVerificationCallback;
+    // Raw public keys (RFC 7250): when set, the server authenticates with this key instead of a certificate chain.
+    private final PublicKey serverRawPublicKey;
+    // When set, the client must authenticate with a raw public key that this verifier accepts.
+    private Predicate<PublicKey> clientRawPublicKeyVerifier;
+    private List<SignatureScheme> clientAuthSignatureSchemes;
+    private PublicKey clientRawPublicKey;
 
     public TlsServerEngineImpl(List<X509Certificate> certificates, PrivateKey certificateKey, List<SignatureScheme> preferredSignatureSchemes,
                                ServerMessageSender serverMessageSender, TlsStatusEventHandler tlsStatusHandler, TlsSessionRegistry tlsSessionRegistry,
@@ -100,8 +110,29 @@ public class TlsServerEngineImpl extends TlsEngineImpl implements TlsServerEngin
     public TlsServerEngineImpl(List<X509Certificate> certificates, PrivateKey certificateKey, List<SignatureScheme> preferredSignatureSchemes,
                                ServerMessageSender serverMessageSender, TlsStatusEventHandler tlsStatusHandler, TlsSessionRegistry tlsSessionRegistry,
                                KeyExchangeFactory keyExchangeFactory, SignatureAlgorithmFactory signatureAlgorithmFactory) {
+        this(certificates, null, certificateKey, preferredSignatureSchemes, serverMessageSender, tlsStatusHandler, tlsSessionRegistry, keyExchangeFactory, signatureAlgorithmFactory);
+    }
+
+    /**
+     * Create new TLS server engine that authenticates with a raw public key (RFC 7250) instead of a certificate.
+     * Clients that do not offer the raw public key server certificate type are refused.
+     *
+     * @param rawPublicKey              the server's public key
+     * @param privateKey                the server's private key
+     * @param preferredSignatureSchemes the signature schemes that the server supports (must be compatible with the key)
+     */
+    public TlsServerEngineImpl(PublicKey rawPublicKey, PrivateKey privateKey, List<SignatureScheme> preferredSignatureSchemes,
+                               ServerMessageSender serverMessageSender, TlsStatusEventHandler tlsStatusHandler, TlsSessionRegistry tlsSessionRegistry,
+                               KeyExchangeFactory keyExchangeFactory, SignatureAlgorithmFactory signatureAlgorithmFactory) {
+        this(null, Objects.requireNonNull(rawPublicKey), privateKey, preferredSignatureSchemes, serverMessageSender, tlsStatusHandler, tlsSessionRegistry, keyExchangeFactory, signatureAlgorithmFactory);
+    }
+
+    private TlsServerEngineImpl(List<X509Certificate> certificates, PublicKey rawPublicKey, PrivateKey certificateKey, List<SignatureScheme> preferredSignatureSchemes,
+                                ServerMessageSender serverMessageSender, TlsStatusEventHandler tlsStatusHandler, TlsSessionRegistry tlsSessionRegistry,
+                                KeyExchangeFactory keyExchangeFactory, SignatureAlgorithmFactory signatureAlgorithmFactory) {
         super(signatureAlgorithmFactory);
         this.serverCertificateChain = certificates;
+        this.serverRawPublicKey = rawPublicKey;
         this.certificatePrivateKey = certificateKey;
         this.preferredSignatureSchemes = preferredSignatureSchemes;
         this.serverMessageSender = serverMessageSender;
@@ -154,6 +185,8 @@ public class TlsServerEngineImpl extends TlsEngineImpl implements TlsServerEngin
         // Negotiate the signature scheme before deciding on a hello retry request: when negotiation fails the
         // handshake cannot succeed, so there is no point in asking the client to retry first.
         signatureScheme = negotiateSignatureScheme(clientHello);
+
+        checkCertificateTypes(clientHello);
 
         validateKeyShares(clientHello);
 
@@ -334,6 +367,28 @@ public class TlsServerEngineImpl extends TlsEngineImpl implements TlsServerEngin
         return determineSignatureAlgorithm(signatureAlgorithmsExtension.getSignatureAlgorithms(), preferredSignatureSchemes);
     }
 
+    /**
+     * https://www.rfc-editor.org/rfc/rfc7250.html#section-4.2
+     * "If the server does not have a certificate of a type the client offers ... it MUST terminate the session with
+     *  a fatal alert of type "unsupported_certificate"."
+     */
+    private void checkCertificateTypes(ClientHello clientHello) throws TlsProtocolException {
+        if (serverRawPublicKey != null && !offersRawPublicKey(clientHello, false)) {
+            throw new UnsupportedCertificateAlert("client does not accept raw public key");
+        }
+        if (clientRawPublicKeyVerifier != null && !offersRawPublicKey(clientHello, true)) {
+            throw new UnsupportedCertificateAlert("client does not offer raw public key for client authentication");
+        }
+    }
+
+    private static boolean offersRawPublicKey(ClientHello clientHello, boolean clientCertificateType) {
+        return clientHello.getExtensions().stream()
+                .filter(ext -> ext instanceof CertificateTypeExtension)
+                .map(ext -> (CertificateTypeExtension) ext)
+                .filter(ext -> ext.isClientCertificateType() == clientCertificateType)
+                .anyMatch(ext -> ext.getCertificateTypes().contains(TlsConstants.CertificateType.RawPublicKey));
+    }
+
     private void collectClientSupportedKeyExchangeModes(ClientHello clientHello) {
         clientHello.getExtensions().stream()
                 .filter(ext -> ext instanceof PskKeyExchangeModesExtension)
@@ -360,7 +415,8 @@ public class TlsServerEngineImpl extends TlsEngineImpl implements TlsServerEngin
                 throw new MissingExtensionAlert("psk_key_exchange_modes extension required with pre_shared_key");
             }
             // Check for PSK Exchange mode; server only supports psk_dhe_ke
-            if (clientSupportedKeyExchangeModes.contains(psk_dhe_ke) && sessionRegistry != null) {
+            // Resumption is not offered with client authentication, as the session does not record the client's key.
+            if (clientSupportedKeyExchangeModes.contains(psk_dhe_ke) && sessionRegistry != null && clientRawPublicKeyVerifier == null) {
                 ClientHelloPreSharedKeyExtension preSharedKeyExtension = (ClientHelloPreSharedKeyExtension) pskExtension.get();
                 selectedIdentity = sessionRegistry.selectIdentity(preSharedKeyExtension.getIdentities(), selectedCipher);
                 if (selectedIdentity != null) {
@@ -441,13 +497,30 @@ public class TlsServerEngineImpl extends TlsEngineImpl implements TlsServerEngin
         if (pskSelection.earlyDataAccepted) {
             serverExtensions.add(new EarlyDataExtension());
         }
+        boolean requestClientAuth = selectedIdentity == null && clientRawPublicKeyVerifier != null;
+        if (selectedIdentity == null && serverRawPublicKey != null) {
+            serverExtensions.add(CertificateTypeExtension.select(TlsConstants.ExtensionType.server_certificate_type, TlsConstants.CertificateType.RawPublicKey));
+        }
+        if (requestClientAuth) {
+            serverExtensions.add(CertificateTypeExtension.select(TlsConstants.ExtensionType.client_certificate_type, TlsConstants.CertificateType.RawPublicKey));
+        }
         EncryptedExtensions encryptedExtensions = new EncryptedExtensions(serverExtensions);
         serverMessageSender.send(encryptedExtensions);
         transcriptHash.record(encryptedExtensions);
 
+        if (requestClientAuth) {
+            // https://datatracker.ietf.org/doc/html/rfc8446#section-4.3.2
+            // "The "signature_algorithms" extension MUST be specified"
+            CertificateRequestMessage certificateRequest = new CertificateRequestMessage(new SignatureAlgorithmsExtension(clientAuthSignatureSchemes));
+            serverMessageSender.send(certificateRequest);
+            transcriptHash.record(certificateRequest);
+        }
+
         // Only if session is not started with a PSK resumption, send certificate and certificate verify
         if (selectedIdentity == null) {
-            CertificateMessage certificate = new CertificateMessage(serverCertificateChain);
+            CertificateMessage certificate = serverRawPublicKey != null?
+                    new CertificateMessage(new byte[0], serverRawPublicKey):
+                    new CertificateMessage(serverCertificateChain);
             serverMessageSender.send(certificate);
             transcriptHash.recordServer(certificate);
 
@@ -467,6 +540,60 @@ public class TlsServerEngineImpl extends TlsEngineImpl implements TlsServerEngin
         transcriptHash.recordServer(finished);
         state.computeApplicationSecrets();
 
+        status = requestClientAuth? Status.WaitClientCertificate: Status.WaitFinished;
+    }
+
+    @Override
+    public void received(CertificateMessage certificateMessage, ProtectionKeysType protectedBy) throws TlsProtocolException {
+        if (status != Status.WaitClientCertificate) {
+            throw new UnexpectedMessageAlert("unexpected certificate message");
+        }
+        if (protectedBy != ProtectionKeysType.Handshake) {
+            throw new UnexpectedMessageAlert("incorrect protection level");
+        }
+        // https://tools.ietf.org/html/rfc8446#section-4.4.2
+        // "If this message is in response to a CertificateRequest, the value of certificate_request_context in that message."
+        if (certificateMessage.getRequestContext().length != 0) {
+            throw new IllegalParameterAlert("certificate request context does not match");
+        }
+        if (certificateMessage.getRawPublicKey() == null) {
+            if (certificateMessage.getCertificateChain().isEmpty()) {
+                // https://datatracker.ietf.org/doc/html/rfc8446#section-4.4.2.4
+                // "If the client does not send any certificates (i.e., it sends an empty Certificate message), the
+                //  server MAY at its discretion either continue the handshake without client authentication or abort
+                //  the handshake with a "certificate_required" alert."
+                throw new CertificateRequiredAlert("client authentication is required");
+            }
+            throw new UnsupportedCertificateAlert("client must authenticate with a raw public key");
+        }
+        clientRawPublicKey = certificateMessage.getRawPublicKey();
+        transcriptHash.recordClient(certificateMessage);
+        status = Status.WaitClientCertificateVerify;
+    }
+
+    @Override
+    public void received(CertificateVerifyMessage certificateVerifyMessage, ProtectionKeysType protectedBy) throws TlsProtocolException {
+        if (status != Status.WaitClientCertificateVerify) {
+            throw new UnexpectedMessageAlert("unexpected certificate verify message");
+        }
+        if (protectedBy != ProtectionKeysType.Handshake) {
+            throw new UnexpectedMessageAlert("incorrect protection level");
+        }
+        SignatureScheme scheme = certificateVerifyMessage.getSignatureScheme();
+        // https://datatracker.ietf.org/doc/html/rfc8446#section-4.4.3
+        // "If sent by a client, the signature algorithm used in the signature MUST be one of those present in the
+        //  supported_signature_algorithms field of the "signature_algorithms" extension in the CertificateRequest message."
+        if (scheme == null || !clientAuthSignatureSchemes.contains(scheme)) {
+            throw new IllegalParameterAlert("signature scheme does not match");
+        }
+        byte[] hash = transcriptHash.getClientHash(TlsConstants.HandshakeType.certificate);
+        if (!verifyCertificateVerify(certificateVerifyMessage.getSignature(), scheme, clientRawPublicKey, hash, true)) {
+            throw new DecryptErrorAlert("signature verification fails");
+        }
+        if (!clientRawPublicKeyVerifier.test(clientRawPublicKey)) {
+            throw new CertificateUnknownAlert("raw public key not accepted");
+        }
+        transcriptHash.recordClient(certificateVerifyMessage);
         status = Status.WaitFinished;
     }
 
@@ -531,7 +658,8 @@ public class TlsServerEngineImpl extends TlsEngineImpl implements TlsServerEngin
         // "The verify_data value is computed as follows:
         //   verify_data = HMAC(finished_key, Transcript-Hash(Handshake Context, Certificate*, CertificateVerify*))
         //      * Only included if present."
-        byte[] serverHmac = computeFinishedVerifyData(transcriptHash.getServerHash(TlsConstants.HandshakeType.finished), state.getClientHandshakeTrafficSecret());
+        // The client certificate and certificate verify messages are only part of the transcript when they were sent.
+        byte[] serverHmac = computeFinishedVerifyData(transcriptHash.getClientHash(TlsConstants.HandshakeType.certificate_verify), state.getClientHandshakeTrafficSecret());
         // https://tools.ietf.org/html/rfc8446#section-4.4
         // "Recipients of Finished messages MUST verify that the contents are correct and if incorrect MUST terminate the connection with a "decrypt_error" alert."
         if (!MessageDigest.isEqual(clientFinished.getVerifyData(), serverHmac)) {
@@ -543,7 +671,7 @@ public class TlsServerEngineImpl extends TlsEngineImpl implements TlsServerEngin
 
         status = Status.Connected;
 
-        if (sessionRegistry != null && clientSupportedKeyExchangeModes.contains(psk_dhe_ke)) {  // Server only supports psk_dhe_ke
+        if (sessionRegistry != null && clientSupportedKeyExchangeModes.contains(psk_dhe_ke) && clientRawPublicKeyVerifier == null) {  // Server only supports psk_dhe_ke
             NewSessionTicketMessage newSessionTicketMessage =
                     sessionRegistry.createNewSessionTicketMessage(currentTicketNumber++, selectedCipher, state, selectedApplicationLayerProtocol, maxEarlyDataSize, additionalSessionData);
             if (newSessionTicketMessage != null) {
@@ -629,6 +757,23 @@ public class TlsServerEngineImpl extends TlsEngineImpl implements TlsServerEngin
     @Override
     public void setSessionDataVerificationCallback(Function<ByteBuffer, Boolean> callback) {
         this.sessionDataVerificationCallback = callback;
+    }
+
+    @Override
+    public void requireClientRawPublicKey(Predicate<PublicKey> verifier, List<SignatureScheme> signatureSchemes) {
+        if (status != Status.Start) {
+            throw new IllegalStateException("handshake already started");
+        }
+        if (signatureSchemes.isEmpty() || !signatureAlgorithmFactory.getSupportedSignatureSchemes().containsAll(signatureSchemes)) {
+            throw new IllegalArgumentException("unsupported signature scheme(s): " + signatureSchemes);
+        }
+        clientRawPublicKeyVerifier = Objects.requireNonNull(verifier);
+        clientAuthSignatureSchemes = List.copyOf(signatureSchemes);
+    }
+
+    @Override
+    public PublicKey getClientRawPublicKey() {
+        return clientRawPublicKey;
     }
 }
 

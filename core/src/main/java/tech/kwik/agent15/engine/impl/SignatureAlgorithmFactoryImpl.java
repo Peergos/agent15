@@ -43,6 +43,8 @@ public class SignatureAlgorithmFactoryImpl implements SignatureAlgorithmFactory 
                 return new EcdsaSecp384r1Sha384();
             case ecdsa_secp521r1_sha512:
                 return new EcdsaSecp521r1Sha512();
+            case ed25519:
+                return new Ed25519();
             default:
                 return null;
         }
@@ -51,7 +53,7 @@ public class SignatureAlgorithmFactoryImpl implements SignatureAlgorithmFactory 
     @Override
     public List<TlsConstants.SignatureScheme> getSupportedSignatureSchemes() {
         return List.of(rsa_pss_rsae_sha256, rsa_pss_rsae_sha384, rsa_pss_rsae_sha512,
-                ecdsa_secp256r1_sha256, ecdsa_secp384r1_sha384, ecdsa_secp521r1_sha512);
+                ecdsa_secp256r1_sha256, ecdsa_secp384r1_sha384, ecdsa_secp521r1_sha512, ed25519);
     }
 
     @Override

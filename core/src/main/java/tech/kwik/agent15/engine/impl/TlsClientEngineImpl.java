@@ -53,6 +53,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.function.Function;
+import java.util.function.Predicate;
 import java.util.stream.Collectors;
 
 import static tech.kwik.agent15.TlsConstants.SignatureScheme.*;
@@ -105,6 +106,14 @@ public class TlsClientEngineImpl extends TlsEngineImpl implements TlsClientEngin
     private List<X500Principal> clientCertificateAuthorities;
     private Function<List<X500Principal>, CertificateWithPrivateKey> clientCertificateSelector;
     private List<TlsConstants.SignatureScheme> serverSupportedSignatureSchemes;
+    private byte[] certificateRequestContext;
+    // Raw public keys (RFC 7250): when the verifier is set, the server must authenticate with a raw public key, which
+    // replaces certificate path validation and host name verification.
+    private Predicate<PublicKey> serverRawPublicKeyVerifier;
+    private PublicKey serverRawPublicKey;
+    private PublicKey clientRawPublicKey;
+    private PrivateKey clientRawPrivateKey;
+    private boolean clientRawPublicKeyNegotiated;
 
 
     public TlsClientEngineImpl(ClientMessageSender clientMessageSender, TlsStatusEventHandler tlsStatusHandler) {
@@ -197,7 +206,7 @@ public class TlsClientEngineImpl extends TlsEngineImpl implements TlsClientEngin
         if (newSessionTicket != null && !supportedCiphers.contains(newSessionTicket.getCipher())) {
             throw new IllegalStateException("For session resumption, support ciphers should contain the cipher used with the session-to-resume (" + newSessionTicket.getCipher().toString() + ")");
         }
-        if (serverName == null || supportedCiphers.isEmpty()) {
+        if ((serverName == null && serverRawPublicKeyVerifier == null) || supportedCiphers.isEmpty()) {
             throw new IllegalStateException("not all mandatory properties are set");
         }
 
@@ -215,18 +224,21 @@ public class TlsClientEngineImpl extends TlsEngineImpl implements TlsClientEngin
         supportedSignatures = signatureSchemes;
         this.offeredGroups = supportedGroups;
 
-        List<Extension> extensions;
+        List<Extension> extensions = new ArrayList<>(requestedExtensions);
+        if (serverRawPublicKeyVerifier != null) {
+            extensions.add(CertificateTypeExtension.offer(TlsConstants.ExtensionType.server_certificate_type, TlsConstants.CertificateType.RawPublicKey));
+        }
+        if (clientRawPublicKey != null) {
+            extensions.add(CertificateTypeExtension.offer(TlsConstants.ExtensionType.client_certificate_type, TlsConstants.CertificateType.RawPublicKey));
+        }
         if (newSessionTicket != null) {
-            extensions = new ArrayList<>();
-            extensions.addAll(requestedExtensions);
+            // https://datatracker.ietf.org/doc/html/rfc8446#section-4.2.11
+            // "The "pre_shared_key" extension MUST be the last extension in the ClientHello"
             extensions.add(new ClientHelloPreSharedKeyExtension(newSessionTicket));
 
             createTlsState(newSessionTicket.getCipher(), newSessionTicket.getPSK());
         }
-        else {
-            extensions = requestedExtensions;
-            // Defer initialization of TlsState until selected cipher is known.
-        }
+        // Else defer initialization of TlsState until selected cipher is known.
 
         clientHello1 = new ClientHello(serverName, keyShares, compatibilityMode,
                 supportedCiphers, supportedSignatures, supportedGroups, extensions, state, ClientHello.PskKeyEstablishmentMode.PSKwithDHE);
@@ -670,9 +682,44 @@ public class TlsClientEngineImpl extends TlsEngineImpl implements TlsClientEngin
         // "There MUST NOT be more than one extension of the same type in a given extension block."
         ExtensionBlockParser.checkForDuplicateExtensions(encryptedExtensions.getExtensions());
 
+        if (!pskAccepted) {
+            checkNegotiatedCertificateTypes(encryptedExtensions.getExtensions());
+        }
+
         transcriptHash.record(encryptedExtensions);
         status = pskAccepted? Status.WaitFinished: Status.WaitCertificateRequest;
         statusHandler.extensionsReceived(encryptedExtensions.getExtensions());
+    }
+
+    /**
+     * https://www.rfc-editor.org/rfc/rfc7250.html#section-4.2
+     * "If the server does not send any server_certificate_type or client_certificate_type extensions in the
+     *  ServerHello, then the server certificate and client certificate types (if any) are X.509."
+     */
+    private void checkNegotiatedCertificateTypes(List<Extension> extensions) throws TlsProtocolException {
+        Optional<TlsConstants.CertificateType> serverType = selectedCertificateType(extensions, false);
+        Optional<TlsConstants.CertificateType> clientType = selectedCertificateType(extensions, true);
+        if (serverRawPublicKeyVerifier != null) {
+            if (serverType.orElse(TlsConstants.CertificateType.X509) != TlsConstants.CertificateType.RawPublicKey) {
+                throw new UnsupportedCertificateAlert("server did not select raw public key certificate type");
+            }
+        }
+        if (clientType.isPresent()) {
+            if (clientType.get() != TlsConstants.CertificateType.RawPublicKey || clientRawPublicKey == null) {
+                // Only offered types can be selected, and this client only offers the raw public key type.
+                throw new IllegalParameterAlert("server selected client certificate type that was not offered");
+            }
+            clientRawPublicKeyNegotiated = true;
+        }
+    }
+
+    private static Optional<TlsConstants.CertificateType> selectedCertificateType(List<Extension> extensions, boolean client) {
+        return extensions.stream()
+                .filter(ext -> ext instanceof CertificateTypeExtension)
+                .map(ext -> (CertificateTypeExtension) ext)
+                .filter(ext -> ext.isClientCertificateType() == client)
+                .findFirst()
+                .map(CertificateTypeExtension::getSelectedCertificateType);
     }
 
     @Override
@@ -698,12 +745,19 @@ public class TlsClientEngineImpl extends TlsEngineImpl implements TlsClientEngin
             // so SHALL is the same as MUST
             throw new IllegalParameterAlert("certificate request context should be zero length");
         }
-        if (certificateMessage.getEndEntityCertificate() == null) {
-            throw new IllegalParameterAlert("missing certificate");
+        if (serverRawPublicKeyVerifier != null) {
+            if (certificateMessage.getRawPublicKey() == null) {
+                throw new BadCertificateAlert("missing raw public key");
+            }
+            serverRawPublicKey = certificateMessage.getRawPublicKey();
         }
-
-        serverCertificate = certificateMessage.getEndEntityCertificate();
-        serverCertificateChain = certificateMessage.getCertificateChain();
+        else {
+            if (certificateMessage.getEndEntityCertificate() == null) {
+                throw new IllegalParameterAlert("missing certificate");
+            }
+            serverCertificate = certificateMessage.getEndEntityCertificate();
+            serverCertificateChain = certificateMessage.getCertificateChain();
+        }
         transcriptHash.recordServer(certificateMessage);
         status = Status.WaitCertificateVerify;
     }
@@ -729,14 +783,27 @@ public class TlsClientEngineImpl extends TlsEngineImpl implements TlsClientEngin
         }
 
         byte[] signature = certificateVerifyMessage.getSignature();
-        if (!verifySignature(signature, signatureScheme, serverCertificate, transcriptHash.getServerHash(TlsConstants.HandshakeType.certificate))) {
-            throw new DecryptErrorAlert("signature verification fails");
+        if (serverRawPublicKeyVerifier != null) {
+            if (!verifyCertificateVerify(signature, signatureScheme, serverRawPublicKey, transcriptHash.getServerHash(TlsConstants.HandshakeType.certificate), false)) {
+                throw new DecryptErrorAlert("signature verification fails");
+            }
+            // https://www.rfc-editor.org/rfc/rfc7250.html#section-6
+            // "the client needs to verify the binding between the raw public key and the server (...) by some
+            //  out-of-band means."
+            if (!serverRawPublicKeyVerifier.test(serverRawPublicKey)) {
+                throw new CertificateUnknownAlert("raw public key not accepted");
+            }
         }
+        else {
+            if (!verifySignature(signature, signatureScheme, serverCertificate, transcriptHash.getServerHash(TlsConstants.HandshakeType.certificate))) {
+                throw new DecryptErrorAlert("signature verification fails");
+            }
 
-        // Now the certificate signature has been validated, check the certificate validity
-        checkCertificateValidity(serverCertificateChain);
-        if (!hostnameVerifier.verify(serverName, serverCertificate)) {
-            throw new CertificateUnknownAlert("servername does not match");
+            // Now the certificate signature has been validated, check the certificate validity
+            checkCertificateValidity(serverCertificateChain);
+            if (!hostnameVerifier.verify(serverName, serverCertificate)) {
+                throw new CertificateUnknownAlert("servername does not match");
+            }
         }
 
         transcriptHash.recordServer(certificateVerifyMessage);
@@ -836,6 +903,7 @@ public class TlsClientEngineImpl extends TlsEngineImpl implements TlsClientEngin
                 .orElseThrow(() -> new MissingExtensionAlert());
 
         transcriptHash.record(certificateRequestMessage);
+        certificateRequestContext = certificateRequestMessage.getCertificateRequestContext();
 
         clientCertificateAuthorities = certificateRequestMessage.getExtensions().stream()
                 .filter(extension -> extension instanceof CertificateAuthoritiesExtension)
@@ -909,6 +977,10 @@ public class TlsClientEngineImpl extends TlsEngineImpl implements TlsClientEngin
     }
 
     private void sendClientAuth() throws IOException, ErrorAlert {
+        if (clientRawPublicKeyNegotiated) {
+            sendRawPublicKeyClientAuth();
+            return;
+        }
         CertificateWithPrivateKey certificateWithKey = clientCertificateSelector.apply(clientCertificateAuthorities);
 
         // Send certificate message (with possible null value for client certificate)
@@ -933,6 +1005,25 @@ public class TlsClientEngineImpl extends TlsEngineImpl implements TlsClientEngin
             sender.send(certificateVerify);
             transcriptHash.recordClient(certificateVerify);
         }
+    }
+
+    private void sendRawPublicKeyClientAuth() throws IOException, ErrorAlert {
+        CertificateMessage certificateMessage = new CertificateMessage(certificateRequestContext, clientRawPublicKey);
+        sender.send(certificateMessage);
+        transcriptHash.recordClient(certificateMessage);
+
+        // https://datatracker.ietf.org/doc/html/rfc8446#section-4.4.3
+        // "If sent by a client, the signature algorithm used in the signature MUST be one of those present in the
+        //  supported_signature_algorithms field of the "signature_algorithms" extension in the CertificateRequest message."
+        TlsConstants.SignatureScheme selectedSignatureScheme = serverSupportedSignatureSchemes.stream()
+                .filter(scheme -> keyMatchesSignatureAlgorithm(clientRawPublicKey, scheme))
+                .findFirst()
+                .orElseThrow(() -> new HandshakeFailureAlert("failed to negotiate signature scheme"));
+        byte[] hash = transcriptHash.getClientHash(TlsConstants.HandshakeType.certificate);
+        byte[] signature = computeSignature(hash, clientRawPrivateKey, selectedSignatureScheme, true);
+        CertificateVerifyMessage certificateVerify = new CertificateVerifyMessage(selectedSignatureScheme, signature);
+        sender.send(certificateVerify);
+        transcriptHash.recordClient(certificateVerify);
     }
 
     private static boolean isExpired(NewSessionTicket ticket) {
@@ -1030,5 +1121,24 @@ public class TlsClientEngineImpl extends TlsEngineImpl implements TlsClientEngin
     @Override
     public void setClientCertificateCallback(Function<List<X500Principal>, CertificateWithPrivateKey> callback) {
         clientCertificateSelector = callback;
+    }
+
+    @Override
+    public void setServerRawPublicKeyVerifier(Predicate<PublicKey> verifier) {
+        serverRawPublicKeyVerifier = verifier;
+    }
+
+    @Override
+    public void setClientRawPublicKey(PublicKey publicKey, PrivateKey privateKey) {
+        if ((publicKey == null) != (privateKey == null)) {
+            throw new IllegalArgumentException();
+        }
+        clientRawPublicKey = publicKey;
+        clientRawPrivateKey = privateKey;
+    }
+
+    @Override
+    public PublicKey getServerRawPublicKey() {
+        return serverRawPublicKey;
     }
 }

@@ -21,6 +21,7 @@ package tech.kwik.agent15.engine.impl;
 import tech.kwik.agent15.TlsConstants;
 import tech.kwik.agent15.alert.ErrorAlert;
 import tech.kwik.agent15.alert.HandshakeFailureAlert;
+import tech.kwik.agent15.alert.IllegalParameterAlert;
 import tech.kwik.agent15.engine.SignatureAlgorithm;
 import tech.kwik.agent15.engine.SignatureAlgorithmFactory;
 import tech.kwik.agent15.engine.TlsEngine;
@@ -35,6 +36,7 @@ import java.nio.charset.StandardCharsets;
 import java.security.InvalidKeyException;
 import java.security.NoSuchAlgorithmException;
 import java.security.PrivateKey;
+import java.security.PublicKey;
 
 public abstract class TlsEngineImpl implements TlsEngine {
 
@@ -92,8 +94,31 @@ public abstract class TlsEngineImpl implements TlsEngine {
      * @return
      */
     protected byte[] computeSignature(byte[] content, PrivateKey certificatePrivateKey, TlsConstants.SignatureScheme signatureScheme, boolean client) throws ErrorAlert {
-        // https://tools.ietf.org/html/rfc8446#section-4.4.3
+        return getSignatureAlgorithm(signatureScheme).sign(certificateVerifyContent(content, client), certificatePrivateKey);
+    }
 
+    /**
+     * Verifies the signature of a received certificate verify message.
+     * @param signature  the signature from the certificate verify message
+     * @param signatureScheme  the signature scheme from the certificate verify message
+     * @param publicKey  the public key of the peer (from its certificate or raw public key)
+     * @param transcriptHash  Transcript-Hash(Handshake Context, Certificate)
+     * @param client  whether the certificate verify message was sent by the client
+     * @return  whether the signature is valid
+     * @throws HandshakeFailureAlert  when the signature scheme is not supported
+     * @throws IllegalParameterAlert  when the public key cannot be used with the signature scheme
+     */
+    protected boolean verifyCertificateVerify(byte[] signature, TlsConstants.SignatureScheme signatureScheme, PublicKey publicKey,
+                                              byte[] transcriptHash, boolean client) throws HandshakeFailureAlert, IllegalParameterAlert {
+        SignatureAlgorithm algorithm = getSignatureAlgorithm(signatureScheme);
+        if (!algorithm.keyMatchesScheme(publicKey)) {
+            throw new IllegalParameterAlert("public key type does not match signature scheme");
+        }
+        return algorithm.verify(certificateVerifyContent(transcriptHash, client), signature, publicKey);
+    }
+
+    private static byte[] certificateVerifyContent(byte[] content, boolean client) {
+        // https://tools.ietf.org/html/rfc8446#section-4.4.3
         //   The digital signature is then computed over the concatenation of:
         //   -  A string that consists of octet 32 (0x20) repeated 64 times
         //   -  The context string
@@ -111,8 +136,7 @@ public abstract class TlsEngineImpl implements TlsEngine {
             // Impossible
             throw new RuntimeException();
         }
-
-        return getSignatureAlgorithm(signatureScheme).sign(signatureInput.toByteArray(), certificatePrivateKey);
+        return signatureInput.toByteArray();
     }
 
     /**

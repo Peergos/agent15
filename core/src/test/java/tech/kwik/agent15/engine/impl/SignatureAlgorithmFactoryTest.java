@@ -26,6 +26,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static tech.kwik.agent15.TlsConstants.SignatureScheme.ecdsa_secp256r1_sha256;
 import static tech.kwik.agent15.TlsConstants.SignatureScheme.ecdsa_secp384r1_sha384;
 import static tech.kwik.agent15.TlsConstants.SignatureScheme.ecdsa_secp521r1_sha512;
+import static tech.kwik.agent15.TlsConstants.SignatureScheme.ed25519;
 import static tech.kwik.agent15.TlsConstants.SignatureScheme.rsa_pkcs1_sha1;
 import static tech.kwik.agent15.TlsConstants.SignatureScheme.rsa_pss_rsae_sha256;
 import static tech.kwik.agent15.TlsConstants.SignatureScheme.rsa_pss_rsae_sha384;
@@ -37,7 +38,7 @@ class SignatureAlgorithmFactoryTest {
     void factoryShouldSupportTheSignatureSchemesCoreImplements() {
         assertThat(new SignatureAlgorithmFactoryImpl().getSupportedSignatureSchemes())
                 .containsExactlyInAnyOrder(rsa_pss_rsae_sha256, rsa_pss_rsae_sha384, rsa_pss_rsae_sha512,
-                        ecdsa_secp256r1_sha256, ecdsa_secp384r1_sha384, ecdsa_secp521r1_sha512);
+                        ecdsa_secp256r1_sha256, ecdsa_secp384r1_sha384, ecdsa_secp521r1_sha512, ed25519);
     }
 
     @Test
@@ -63,6 +64,7 @@ class SignatureAlgorithmFactoryTest {
         assertThat(factory.forSignatureScheme(rsa_pss_rsae_sha512)).isInstanceOf(RsaPssRsaeSha512.class);
         assertThat(factory.forSignatureScheme(ecdsa_secp256r1_sha256)).isInstanceOf(EcdsaSecp256r1Sha256.class);
         assertThat(factory.forSignatureScheme(ecdsa_secp384r1_sha384)).isInstanceOf(EcdsaSecp384r1Sha384.class);
+        assertThat(factory.forSignatureScheme(ed25519)).isInstanceOf(Ed25519.class);
         assertThat(factory.forSignatureScheme(ecdsa_secp521r1_sha512)).isInstanceOf(EcdsaSecp521r1Sha512.class);
     }
 

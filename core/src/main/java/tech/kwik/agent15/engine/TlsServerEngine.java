@@ -29,6 +29,8 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.List;
 import java.util.function.Function;
+import java.util.function.Predicate;
+import java.security.PublicKey;
 
 public interface TlsServerEngine extends TlsEngine {
 
@@ -107,4 +109,18 @@ public interface TlsServerEngine extends TlsEngine {
     void received(ClientHello clientHello, ProtectionKeysType protectedBy) throws TlsProtocolException, IOException;
 
     void received(FinishedMessage clientFinished, ProtectionKeysType protectedBy) throws TlsProtocolException, IOException;
+
+    /**
+     * Requires the client to authenticate with a raw public key (RFC 7250). Clients that do not offer the raw public
+     * key client certificate type are refused. Session resumption is disabled, so every handshake authenticates the
+     * client.
+     * @param verifier  returns whether the client's raw public key is accepted
+     * @param signatureSchemes  the signature schemes accepted for the client's certificate verify message
+     */
+    void requireClientRawPublicKey(Predicate<PublicKey> verifier, List<TlsConstants.SignatureScheme> signatureSchemes);
+
+    /**
+     * @return  the raw public key the client authenticated with, or null when the client did not (yet) authenticate
+     */
+    PublicKey getClientRawPublicKey();
 }

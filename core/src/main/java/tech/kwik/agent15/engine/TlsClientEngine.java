@@ -33,6 +33,9 @@ import java.io.IOException;
 import java.security.cert.X509Certificate;
 import java.util.List;
 import java.util.function.Function;
+import java.util.function.Predicate;
+import java.security.PrivateKey;
+import java.security.PublicKey;
 
 public interface TlsClientEngine extends TlsEngine {
 
@@ -175,4 +178,22 @@ public interface TlsClientEngine extends TlsEngine {
     void received(NewSessionTicketMessage nst, ProtectionKeysType protectedBy) throws UnexpectedMessageAlert;
 
     void received(CertificateRequestMessage certificateRequestMessage, ProtectionKeysType protectedBy) throws TlsProtocolException, IOException;
+
+    /**
+     * Requires the server to authenticate with a raw public key (RFC 7250) instead of an X.509 certificate. The
+     * verifier decides whether the server's key is acceptable; certificate path validation and host name
+     * verification are not done. A server name is optional in this mode; when not set, no SNI is sent.
+     * @param verifier  returns whether the server's raw public key is accepted
+     */
+    void setServerRawPublicKeyVerifier(Predicate<PublicKey> verifier);
+
+    /**
+     * Sets the raw public key (RFC 7250) to authenticate with when the server requests client authentication.
+     */
+    void setClientRawPublicKey(PublicKey publicKey, PrivateKey privateKey);
+
+    /**
+     * @return  the raw public key the server authenticated with, or null when no raw public key was received
+     */
+    PublicKey getServerRawPublicKey();
 }

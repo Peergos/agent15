@@ -151,6 +151,16 @@ public class ExtensionBlockParser {
                 check(context, client_hello, certificate_request);
                 extensions.add(CertificateAuthoritiesExtension.parse(buffer));
             }
+            else if (extensionType == TlsConstants.ExtensionType.client_certificate_type.value) {
+                // "| client_certificate_type (RFC 7250)               |      CH, EE |"
+                check(context, client_hello, encrypted_extensions);
+                extensions.add(CertificateTypeExtension.parse(buffer, TlsConstants.ExtensionType.client_certificate_type, context));
+            }
+            else if (extensionType == TlsConstants.ExtensionType.server_certificate_type.value) {
+                // "| server_certificate_type (RFC 7250)               |      CH, EE |"
+                check(context, client_hello, encrypted_extensions);
+                extensions.add(CertificateTypeExtension.parse(buffer, TlsConstants.ExtensionType.server_certificate_type, context));
+            }
             else if (extensionType == TlsConstants.ExtensionType.key_share.value) {
                 // "| key_share (RFC 8446)                             | CH, SH, HRR |"
                 check(context, client_hello, server_hello);

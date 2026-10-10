@@ -25,6 +25,11 @@ import tech.kwik.agent15.TlsConstants;
 import java.io.ByteArrayInputStream;
 import java.nio.BufferUnderflowException;
 import java.nio.ByteBuffer;
+import java.security.KeyFactory;
+import java.security.NoSuchAlgorithmException;
+import java.security.PublicKey;
+import java.security.spec.InvalidKeySpecException;
+import java.security.spec.X509EncodedKeySpec;
 import java.security.cert.CertificateEncodingException;
 import java.security.cert.CertificateException;
 import java.security.cert.CertificateFactory;
@@ -33,6 +38,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.stream.Collectors;
 
 // https://tools.ietf.org/html/rfc8446#section-4.4.2
@@ -42,6 +48,9 @@ public class CertificateMessage extends HandshakeMessage {
     private final byte[] requestContext;
     private final X509Certificate endEntityCertificate;
     private final List<X509Certificate> certificateChain;
+    // https://www.rfc-editor.org/rfc/rfc7250.html#section-3: with the RawPublicKey certificate type, the single
+    // CertificateEntry holds a DER-encoded SubjectPublicKeyInfo instead of an X.509 certificate.
+    private final PublicKey rawPublicKey;
     private final byte[] raw;
 
     public CertificateMessage(X509Certificate certificate) {
@@ -53,8 +62,9 @@ public class CertificateMessage extends HandshakeMessage {
         else {
             certificateChain = Collections.emptyList();
         }
+        rawPublicKey = null;
 
-        raw = serialize(certificateChain);
+        raw = serialize(requestContext, encode(certificateChain));
     }
 
     /**
@@ -68,8 +78,9 @@ public class CertificateMessage extends HandshakeMessage {
         this.requestContext = new byte[0];
         endEntityCertificate = certificateChain.get(0);
         this.certificateChain = certificateChain;
+        rawPublicKey = null;
 
-        raw = serialize(certificateChain);
+        raw = serialize(requestContext, encode(certificateChain));
     }
 
     public CertificateMessage(byte[] requestContext, X509Certificate certificate) {
@@ -77,15 +88,36 @@ public class CertificateMessage extends HandshakeMessage {
         this.requestContext = requestContext;
         endEntityCertificate = certificate;
         certificateChain = List.of(certificate);
+        rawPublicKey = null;
 
-        raw = serialize(certificateChain);
+        raw = serialize(requestContext, encode(certificateChain));
+    }
+
+    /**
+     * Creates a certificate message for the RawPublicKey certificate type (RFC 7250).
+     * @param requestContext  the certificate request context (empty for server authentication)
+     * @param rawPublicKey    the public key; its encoding must be a SubjectPublicKeyInfo (as JCA public keys are)
+     */
+    public CertificateMessage(byte[] requestContext, PublicKey rawPublicKey) {
+        Objects.requireNonNull(requestContext);
+        Objects.requireNonNull(rawPublicKey);
+        if (!"X.509".equals(rawPublicKey.getFormat())) {
+            throw new IllegalArgumentException("public key must be encoded as SubjectPublicKeyInfo");
+        }
+        this.requestContext = requestContext;
+        this.rawPublicKey = rawPublicKey;
+        endEntityCertificate = null;
+        certificateChain = Collections.emptyList();
+
+        raw = serialize(requestContext, List.of(rawPublicKey.getEncoded()));
     }
 
     private CertificateMessage(byte[] requestContext, X509Certificate endEntityCertificate,
-                               List<X509Certificate> certificateChain, byte[] raw) {
+                               List<X509Certificate> certificateChain, PublicKey rawPublicKey, byte[] raw) {
         this.requestContext = requestContext;
         this.endEntityCertificate = endEntityCertificate;
         this.certificateChain = certificateChain;
+        this.rawPublicKey = rawPublicKey;
         this.raw = raw;
     }
 
@@ -114,14 +146,33 @@ public class CertificateMessage extends HandshakeMessage {
             else {
                 requestContext = new byte[0];
             }
+            List<byte[]> entries = parseCertificateEntries(buffer);
             List<X509Certificate> certificateChain = new ArrayList<>();
-            X509Certificate endEntityCertificate = parseCertificateEntries(buffer, certificateChain);
+            X509Certificate endEntityCertificate = null;
+            PublicKey rawPublicKey = null;
+            if (!entries.isEmpty()) {
+                // The certificate type is negotiated in the encrypted extensions, which the parser does not know. But
+                // a DER-encoded X.509 certificate is never a valid SubjectPublicKeyInfo (nor vice versa), so the
+                // contents determine the type unambiguously; the engine checks it matches what was negotiated.
+                Optional<PublicKey> spki = entries.size() == 1? decodeSubjectPublicKeyInfo(entries.get(0)): Optional.empty();
+                if (spki.isPresent()) {
+                    rawPublicKey = spki.get();
+                }
+                else {
+                    for (byte[] entry : entries) {
+                        certificateChain.add(decodeX509(entry));
+                    }
+                    // https://tools.ietf.org/html/rfc8446#section-4.4.2
+                    // "The sender's certificate MUST come in the first CertificateEntry in the list. "
+                    endEntityCertificate = certificateChain.get(0);
+                }
+            }
 
             byte[] raw = new byte[4 + remainingLength];
             buffer.position(startPosition);
             buffer.get(raw);
 
-            return new CertificateMessage(requestContext, endEntityCertificate, certificateChain, raw);
+            return new CertificateMessage(requestContext, endEntityCertificate, certificateChain, rawPublicKey, raw);
         }
         catch (BufferUnderflowException notEnoughBytes) {
             throw new DecodeErrorException("message underflow");
@@ -129,42 +180,22 @@ public class CertificateMessage extends HandshakeMessage {
     }
 
     /**
-     * Parses the certificate entries of a certificate message and adds them to the given certificate chain.
-     * @return  the end entity certificate, or null if the message does not contain any certificate
+     * Parses the certificate entries of a certificate message.
+     * @return  the (non-empty) certificate data of each entry, in order
      */
-    private static X509Certificate parseCertificateEntries(ByteBuffer buffer, List<X509Certificate> certificateChain) throws BadCertificateAlert {
+    private static List<byte[]> parseCertificateEntries(ByteBuffer buffer) {
         int certificateListSize = ((buffer.get() & 0xff) << 16) | ((buffer.get() & 0xff) << 8) | (buffer.get() & 0xff);
         int remainingCertificateBytes = certificateListSize;
-        int certCount = 0;
-        X509Certificate endEntityCertificate = null;
+        List<byte[]> entries = new ArrayList<>();
 
         while (remainingCertificateBytes > 0) {
             int certSize = ((buffer.get() & 0xff) << 16) | ((buffer.get() & 0xff) << 8) | (buffer.get() & 0xff);
             byte[] certificateData = new byte[certSize];
             buffer.get(certificateData);
-
             if (certSize > 0) {
-                // https://tools.ietf.org/html/rfc8446#section-4.4.2
-                // "If the corresponding certificate type extension ("server_certificate_type" or "client_certificate_type")
-                // was not negotiated in EncryptedExtensions, or the X.509 certificate type was negotiated, then each
-                // CertificateEntry contains a DER-encoded X.509 certificate."
-                // This implementation does not support raw-public-key certificates, so the only type supported is X509.
-                try {
-                    CertificateFactory cf = CertificateFactory.getInstance("X.509");
-                    X509Certificate certificate = (X509Certificate) cf.generateCertificate(new ByteArrayInputStream(certificateData));
-                    if (certCount == 0) {
-                        // https://tools.ietf.org/html/rfc8446#section-4.4.2
-                        // "The sender's certificate MUST come in the first CertificateEntry in the list. "
-                        endEntityCertificate = certificate;
-                    }
-                    certificateChain.add(certificate);
-                } catch (CertificateException e) {
-                    throw new BadCertificateAlert("could not parse certificate");
-                }
+                entries.add(certificateData);
             }
-
             remainingCertificateBytes -= (3 + certSize);
-            certCount++;
             int extensionsSize = buffer.getShort() & 0xffff;
             // https://tools.ietf.org/html/rfc8446#section-4.4.2
             // "Valid extensions for server certificates at present include the OCSP Status extension [RFC6066]
@@ -174,26 +205,57 @@ public class CertificateMessage extends HandshakeMessage {
             buffer.get(extensionData);
             remainingCertificateBytes -= (2 + extensionsSize);
         }
-        return endEntityCertificate;
+        return entries;
     }
 
-    private static byte[] serialize(List<X509Certificate> certificateChain) {
-        int nrOfCerts = certificateChain.size();
-        List<byte[]> encodedCerts = certificateChain.stream()
+    private static X509Certificate decodeX509(byte[] certificateData) throws BadCertificateAlert {
+        try {
+            CertificateFactory cf = CertificateFactory.getInstance("X.509");
+            return (X509Certificate) cf.generateCertificate(new ByteArrayInputStream(certificateData));
+        }
+        catch (CertificateException e) {
+            throw new BadCertificateAlert("could not parse certificate");
+        }
+    }
+
+    private static final List<String> RAW_PUBLIC_KEY_ALGORITHMS = List.of("Ed25519", "Ed448", "EC", "RSA");
+
+    static Optional<PublicKey> decodeSubjectPublicKeyInfo(byte[] data) {
+        X509EncodedKeySpec keySpec = new X509EncodedKeySpec(data);
+        for (String algorithm : RAW_PUBLIC_KEY_ALGORITHMS) {
+            try {
+                PublicKey key = KeyFactory.getInstance(algorithm).generatePublic(keySpec);
+                // Guard against lenient decoders that ignore trailing data.
+                if (java.util.Arrays.equals(key.getEncoded(), data)) {
+                    return Optional.of(key);
+                }
+            }
+            catch (NoSuchAlgorithmException | InvalidKeySpecException | ClassCastException | IllegalArgumentException e) {
+                // Not this algorithm, try the next one.
+            }
+        }
+        return Optional.empty();
+    }
+
+    private static List<byte[]> encode(List<X509Certificate> certificateChain) {
+        return certificateChain.stream()
                 .map(cert -> encode(cert))
                 .collect(Collectors.toList());
+    }
 
-        int msgSize = 4 + 1 + 3 + nrOfCerts * (3 + 2) + encodedCerts.stream().mapToInt(bytes -> bytes.length).sum();
+    private static byte[] serialize(byte[] requestContext, List<byte[]> encodedEntries) {
+        int nrOfEntries = encodedEntries.size();
+        int msgSize = 4 + 1 + requestContext.length + 3 + nrOfEntries * (3 + 2) + encodedEntries.stream().mapToInt(bytes -> bytes.length).sum();
         ByteBuffer buffer = ByteBuffer.allocate(msgSize);
 
         buffer.putInt((TlsConstants.HandshakeType.certificate.value << 24) | (msgSize - 4));
-        // cert request context size
-        buffer.put((byte) 0x00);
+        buffer.put((byte) requestContext.length);
+        buffer.put(requestContext);
         // certificate_list size (3 bytes)
         buffer.put((byte) 0); // assuming < 65535
-        buffer.putShort((short) (msgSize - 4 - 1 - 3));
+        buffer.putShort((short) (msgSize - 4 - 1 - requestContext.length - 3));
 
-        encodedCerts.forEach(encodedCert -> {
+        encodedEntries.forEach(encodedCert -> {
             if (encodedCert.length > 0xfff0) {
                 throw new RuntimeException("Certificate size not supported");
             }
@@ -232,5 +294,12 @@ public class CertificateMessage extends HandshakeMessage {
 
     public List<X509Certificate> getCertificateChain() {
         return certificateChain;
+    }
+
+    /**
+     * @return  the raw public key (RFC 7250) this message carries, or null when it carries X.509 certificates or nothing
+     */
+    public PublicKey getRawPublicKey() {
+        return rawPublicKey;
     }
 }

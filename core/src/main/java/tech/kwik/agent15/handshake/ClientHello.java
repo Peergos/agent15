@@ -342,16 +342,15 @@ public class ClientHello extends HandshakeMessage {
             throw new IllegalArgumentException("the key share groups must occur in supportedGroups, in the same order");
         }
 
-        Extension[] defaultExtensions = new Extension[] {
-                new ServerNameExtension(serverName),
-                new SupportedVersionsExtension(TlsConstants.HandshakeType.client_hello),
-                new SupportedGroupsExtension(supportedGroups),
-                new SignatureAlgorithmsExtension(supportedSignatures),
-                new KeyShareExtension(keyShares, TlsConstants.HandshakeType.client_hello),
-        };
-
         List<Extension> extensions = new ArrayList<>();
-        extensions.addAll(List.of(defaultExtensions));
+        // A null server name omits the server name indication, e.g. when the server is identified by its raw public key.
+        if (serverName != null) {
+            extensions.add(new ServerNameExtension(serverName));
+        }
+        extensions.add(new SupportedVersionsExtension(TlsConstants.HandshakeType.client_hello));
+        extensions.add(new SupportedGroupsExtension(supportedGroups));
+        extensions.add(new SignatureAlgorithmsExtension(supportedSignatures));
+        extensions.add(new KeyShareExtension(keyShares, TlsConstants.HandshakeType.client_hello));
         if (pskKeyEstablishmentMode != PskKeyEstablishmentMode.none) {
             extensions.add(createPskKeyExchangeModesExtension(pskKeyEstablishmentMode));
         }

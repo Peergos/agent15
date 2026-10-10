@@ -35,6 +35,7 @@ import java.security.cert.CertificateException;
 import java.security.cert.CertificateFactory;
 import java.security.cert.X509Certificate;
 import java.security.interfaces.ECPublicKey;
+import java.security.interfaces.EdECPublicKey;
 import java.security.interfaces.RSAPrivateKey;
 import java.security.interfaces.RSAPublicKey;
 import java.security.spec.ECGenParameterSpec;
@@ -47,6 +48,7 @@ import java.util.Arrays;
 import java.util.Base64;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.function.Predicate;
 import java.util.stream.Collectors;
 
 import static tech.kwik.agent15.TlsConstants.SignatureScheme.*;
@@ -66,6 +68,9 @@ public class TlsServerEngineFactory {
     private final PrivateKey certificateKey;
     private final TlsSessionRegistry tlsSessionRegistry = new TlsSessionRegistryImpl();
     private final List<TlsConstants.SignatureScheme> preferredSignatureSchemes;
+    private final PublicKey rawPublicKey;
+    private Predicate<PublicKey> clientRawPublicKeyVerifier;
+    private List<TlsConstants.SignatureScheme> clientAuthSignatureSchemes;
 
     /**
      * Creates a tls server engine factory, given an RSA certificate and its private key.
@@ -110,7 +115,34 @@ public class TlsServerEngineFactory {
     private TlsServerEngineFactory(List<X509Certificate> certificateChain, PrivateKey certificateKey, String ecCurve) throws CertificateException {
         this.certificateChain = certificateChain;
         this.certificateKey = certificateKey;
+        this.rawPublicKey = null;
         preferredSignatureSchemes = preferredSignatureSchemes(certificateChain.get(0), ecCurve);
+    }
+
+    /**
+     * Creates a tls server engine factory for engines that authenticate with a raw public key (RFC 7250) instead of a
+     * certificate. Only Ed25519 keys are supported.
+     * @param rawPublicKey  the server's public key
+     * @param privateKey    the server's private key
+     */
+    public TlsServerEngineFactory(PublicKey rawPublicKey, PrivateKey privateKey) {
+        if (!(rawPublicKey instanceof EdECPublicKey) || !"Ed25519".equals(((EdECPublicKey) rawPublicKey).getParams().getName())) {
+            throw new IllegalArgumentException("Unsupported raw public key type " + rawPublicKey.getAlgorithm());
+        }
+        this.certificateChain = null;
+        this.certificateKey = privateKey;
+        this.rawPublicKey = rawPublicKey;
+        preferredSignatureSchemes = List.of(ed25519);
+    }
+
+    /**
+     * Makes the engines created by this factory require client authentication with a raw public key (RFC 7250).
+     * @param verifier  returns whether the client's raw public key is accepted
+     * @param signatureSchemes  the signature schemes accepted for the client's certificate verify message
+     */
+    public void requireClientRawPublicKey(Predicate<PublicKey> verifier, List<TlsConstants.SignatureScheme> signatureSchemes) {
+        clientRawPublicKeyVerifier = verifier;
+        clientAuthSignatureSchemes = List.copyOf(signatureSchemes);
     }
 
     private static List<X509Certificate> getCertificates(KeyStore keyStore, String alias) {
@@ -141,8 +173,14 @@ public class TlsServerEngineFactory {
     }
 
     public TlsServerEngine createServerEngine(ServerMessageSender serverMessageSender, TlsStatusEventHandler tlsStatusHandler) {
-        TlsServerEngineImpl tlsServerEngine = new TlsServerEngineImpl(certificateChain, certificateKey, preferredSignatureSchemes,
-                serverMessageSender, tlsStatusHandler, tlsSessionRegistry, new KeyExchangeFactoryScanner(), new SignatureAlgorithmFactoryScanner());
+        TlsServerEngineImpl tlsServerEngine = rawPublicKey != null?
+                new TlsServerEngineImpl(rawPublicKey, certificateKey, preferredSignatureSchemes,
+                        serverMessageSender, tlsStatusHandler, tlsSessionRegistry, new KeyExchangeFactoryScanner(), new SignatureAlgorithmFactoryScanner()):
+                new TlsServerEngineImpl(certificateChain, certificateKey, preferredSignatureSchemes,
+                        serverMessageSender, tlsStatusHandler, tlsSessionRegistry, new KeyExchangeFactoryScanner(), new SignatureAlgorithmFactoryScanner());
+        if (clientRawPublicKeyVerifier != null) {
+            tlsServerEngine.requireClientRawPublicKey(clientRawPublicKeyVerifier, clientAuthSignatureSchemes);
+        }
         tlsServerEngine.addSupportedCiphers(List.of(TlsConstants.CipherSuite.TLS_AES_128_GCM_SHA256));
         return tlsServerEngine;
     }

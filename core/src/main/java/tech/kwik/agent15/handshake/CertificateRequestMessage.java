@@ -114,4 +114,8 @@ public class CertificateRequestMessage extends HandshakeMessage {
     public List<Extension> getExtensions() {
         return extensions;
     }
+
+    public byte[] getCertificateRequestContext() {
+        return certificateRequestContext;
+    }
 }
