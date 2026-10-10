@@ -236,4 +236,33 @@ class DefaultHostnameVerifierTest {
         // Then
         assertThat(matches).isFalse();
     }
+
+    @Test
+    void ipLiteralShouldMatchIpAddressSan() {
+        List<List<?>> subjectAlternativeNames = List.of(List.of(2, "relay.example"), List.of(7, "203.0.113.7"));
+        assertThat(verifier.verifyHostname("203.0.113.7", subjectAlternativeNames)).isTrue();
+        assertThat(verifier.verifyHostname("203.0.113.8", subjectAlternativeNames)).isFalse();
+    }
+
+    @Test
+    void ipLiteralShouldNotMatchDnsNameSan() {
+        List<List<?>> subjectAlternativeNames = List.of(List.of(2, "203.0.113.7"));
+        assertThat(verifier.verifyHostname("203.0.113.7", subjectAlternativeNames)).isFalse();
+    }
+
+    @Test
+    void ipv6LiteralShouldMatchRegardlessOfNotation() {
+        // Java presents iPAddress SAN entries in full notation
+        List<List<?>> subjectAlternativeNames = List.of(List.of(7, "2001:db8:0:0:0:0:0:1"));
+        assertThat(verifier.verifyHostname("2001:db8::1", subjectAlternativeNames)).isTrue();
+        assertThat(verifier.verifyHostname("[2001:db8::1]", subjectAlternativeNames)).isTrue();
+    }
+
+    @Test
+    void hostNamesAreNotIpLiterals() {
+        assertThat(DefaultHostnameVerifier.parseIpLiteral("example.com")).isEmpty();
+        assertThat(DefaultHostnameVerifier.parseIpLiteral("1.2.3.4.example")).isEmpty();
+        assertThat(DefaultHostnameVerifier.parseIpLiteral("256.1.1.1")).isEmpty();
+        assertThat(DefaultHostnameVerifier.parseIpLiteral("10.0.0.1")).isPresent();
+    }
 }

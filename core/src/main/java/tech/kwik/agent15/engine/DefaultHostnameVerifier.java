@@ -23,11 +23,15 @@ import tech.kwik.agent15.log.Logger;
 import javax.naming.InvalidNameException;
 import javax.naming.ldap.LdapName;
 import javax.naming.ldap.Rdn;
+import java.net.InetAddress;
+import java.net.UnknownHostException;
 import java.security.Principal;
 import java.security.cert.CertificateParsingException;
 import java.security.cert.X509Certificate;
 import java.util.Collection;
 import java.util.List;
+import java.util.Optional;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 /**
@@ -65,6 +69,16 @@ public class DefaultHostnameVerifier implements HostnameVerifier {
             return false;
         }
 
+        Optional<InetAddress> ipLiteral = parseIpLiteral(serverName);
+        if (ipLiteral.isPresent()) {
+            // https://datatracker.ietf.org/doc/html/rfc6125#section-1.7.2: an IP address reference identity is
+            // matched against iPAddress SAN entries only.
+            return subjectAlternativeNames.stream()
+                    .filter(entryList -> entryList.get(0).equals(7))   // 7 is "iPAddress"
+                    .map(entryList -> parseIpLiteral((String) entryList.get(1)))
+                    .anyMatch(address -> address.equals(ipLiteral));
+        }
+
         return subjectAlternativeNames.stream()
                 // Each entry is a List whose first entry is an Integer (the name type, 0-8) and whose
                 // second entry is a String or a byte array (the name, in string or ASN.1 DER encoded form, respectively).
@@ -72,6 +86,31 @@ public class DefaultHostnameVerifier implements HostnameVerifier {
                 .map(entryList -> (String) entryList.get(1))
                 .anyMatch(dnsName -> serverNameMatchesDnsName(serverName, dnsName));
     }
+
+    /**
+     * Parses an IPv4 or IPv6 literal without doing any name resolution.
+     */
+    public static Optional<InetAddress> parseIpLiteral(String name) {
+        if (name == null) {
+            return Optional.empty();
+        }
+        String literal = name.startsWith("[") && name.endsWith("]")? name.substring(1, name.length() - 1): name;
+        boolean ipv4 = IPV4_LITERAL.matcher(literal).matches();
+        boolean ipv6 = literal.contains(":") && IPV6_CHARACTERS.matcher(literal).matches();
+        if (!ipv4 && !ipv6) {
+            return Optional.empty();
+        }
+        try {
+            // A literal is never looked up.
+            return Optional.of(InetAddress.getByName(literal));
+        }
+        catch (UnknownHostException e) {
+            return Optional.empty();
+        }
+    }
+
+    private static final Pattern IPV4_LITERAL = Pattern.compile("(25[0-5]|2[0-4]\\d|1?\\d?\\d)(\\.(25[0-5]|2[0-4]\\d|1?\\d?\\d)){3}");
+    private static final Pattern IPV6_CHARACTERS = Pattern.compile("[0-9a-fA-F:.]+");
 
     boolean serverNameMatchesDnsName(String serverName, String dnsName) {
         if (serverName == null || dnsName == null || serverName.trim().equals("") || dnsName.trim().equals("")) {

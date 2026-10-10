@@ -23,6 +23,7 @@ import tech.kwik.agent15.TlsConstants;
 import tech.kwik.agent15.TlsProtocolException;
 import tech.kwik.agent15.alert.DecodeErrorException;
 import tech.kwik.agent15.alert.IllegalParameterAlert;
+import tech.kwik.agent15.engine.DefaultHostnameVerifier;
 import tech.kwik.agent15.extension.*;
 import tech.kwik.agent15.util.ListUtils;
 
@@ -344,7 +345,8 @@ public class ClientHello extends HandshakeMessage {
 
         List<Extension> extensions = new ArrayList<>();
         // A null server name omits the server name indication, e.g. when the server is identified by its raw public key.
-        if (serverName != null) {
+        // https://www.rfc-editor.org/rfc/rfc6066#section-3: "Literal IPv4 and IPv6 addresses are not permitted in "HostName"."
+        if (serverName != null && DefaultHostnameVerifier.parseIpLiteral(serverName).isEmpty()) {
             extensions.add(new ServerNameExtension(serverName));
         }
         extensions.add(new SupportedVersionsExtension(TlsConstants.HandshakeType.client_hello));
