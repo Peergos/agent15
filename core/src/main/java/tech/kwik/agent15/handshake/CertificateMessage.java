@@ -44,7 +44,9 @@ import java.util.stream.Collectors;
 // https://tools.ietf.org/html/rfc8446#section-4.4.2
 public class CertificateMessage extends HandshakeMessage {
 
-    private static final int MINIMUM_MESSAGE_SIZE = 1 + 3 + 1 + 3 + 3 + 2;
+    // Type, length, request context length, certificate list length: the list can be empty, as sent by a client that
+    // has no certificate (https://www.rfc-editor.org/rfc/rfc8446.html#section-4.4.2.4)
+    private static final int MINIMUM_MESSAGE_SIZE = 1 + 3 + 1 + 3;
     private final byte[] requestContext;
     private final X509Certificate endEntityCertificate;
     private final List<X509Certificate> certificateChain;

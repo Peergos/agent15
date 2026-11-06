@@ -28,6 +28,8 @@ import tech.kwik.agent15.extension.*;
 import tech.kwik.agent15.handshake.*;
 import tech.kwik.agent15.util.ListUtils;
 
+import javax.net.ssl.X509TrustManager;
+import java.security.cert.CertificateException;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.security.MessageDigest;
@@ -87,6 +89,9 @@ public class TlsServerEngineImpl extends TlsEngineImpl implements TlsServerEngin
     private Predicate<PublicKey> clientRawPublicKeyVerifier;
     private List<SignatureScheme> clientAuthSignatureSchemes;
     private PublicKey clientRawPublicKey;
+    // When set, the client must authenticate with an X.509 certificate chain that this trust manager accepts.
+    private X509TrustManager clientCertificateTrustManager;
+    private List<X509Certificate> clientCertificateChain;
 
     public TlsServerEngineImpl(List<X509Certificate> certificates, PrivateKey certificateKey, List<SignatureScheme> preferredSignatureSchemes,
                                ServerMessageSender serverMessageSender, TlsStatusEventHandler tlsStatusHandler, TlsSessionRegistry tlsSessionRegistry,
@@ -416,7 +421,7 @@ public class TlsServerEngineImpl extends TlsEngineImpl implements TlsServerEngin
             }
             // Check for PSK Exchange mode; server only supports psk_dhe_ke
             // Resumption is not offered with client authentication, as the session does not record the client's key.
-            if (clientSupportedKeyExchangeModes.contains(psk_dhe_ke) && sessionRegistry != null && clientRawPublicKeyVerifier == null) {
+            if (clientSupportedKeyExchangeModes.contains(psk_dhe_ke) && sessionRegistry != null && !clientAuthenticationRequired()) {
                 ClientHelloPreSharedKeyExtension preSharedKeyExtension = (ClientHelloPreSharedKeyExtension) pskExtension.get();
                 selectedIdentity = sessionRegistry.selectIdentity(preSharedKeyExtension.getIdentities(), selectedCipher);
                 if (selectedIdentity != null) {
@@ -497,11 +502,11 @@ public class TlsServerEngineImpl extends TlsEngineImpl implements TlsServerEngin
         if (pskSelection.earlyDataAccepted) {
             serverExtensions.add(new EarlyDataExtension());
         }
-        boolean requestClientAuth = selectedIdentity == null && clientRawPublicKeyVerifier != null;
+        boolean requestClientAuth = selectedIdentity == null && clientAuthenticationRequired();
         if (selectedIdentity == null && serverRawPublicKey != null) {
             serverExtensions.add(CertificateTypeExtension.select(TlsConstants.ExtensionType.server_certificate_type, TlsConstants.CertificateType.RawPublicKey));
         }
-        if (requestClientAuth) {
+        if (requestClientAuth && clientRawPublicKeyVerifier != null) {
             serverExtensions.add(CertificateTypeExtension.select(TlsConstants.ExtensionType.client_certificate_type, TlsConstants.CertificateType.RawPublicKey));
         }
         EncryptedExtensions encryptedExtensions = new EncryptedExtensions(serverExtensions);
@@ -556,6 +561,18 @@ public class TlsServerEngineImpl extends TlsEngineImpl implements TlsServerEngin
         if (certificateMessage.getRequestContext().length != 0) {
             throw new IllegalParameterAlert("certificate request context does not match");
         }
+        if (clientCertificateTrustManager != null) {
+            if (certificateMessage.getRawPublicKey() != null) {
+                throw new UnsupportedCertificateAlert("client must authenticate with an X.509 certificate");
+            }
+            if (certificateMessage.getCertificateChain().isEmpty()) {
+                throw new CertificateRequiredAlert("client authentication is required");
+            }
+            clientCertificateChain = List.copyOf(certificateMessage.getCertificateChain());
+            transcriptHash.recordClient(certificateMessage);
+            status = Status.WaitClientCertificateVerify;
+            return;
+        }
         if (certificateMessage.getRawPublicKey() == null) {
             if (certificateMessage.getCertificateChain().isEmpty()) {
                 // https://datatracker.ietf.org/doc/html/rfc8446#section-4.4.2.4
@@ -587,10 +604,20 @@ public class TlsServerEngineImpl extends TlsEngineImpl implements TlsServerEngin
             throw new IllegalParameterAlert("signature scheme does not match");
         }
         byte[] hash = transcriptHash.getClientHash(TlsConstants.HandshakeType.certificate);
-        if (!verifyCertificateVerify(certificateVerifyMessage.getSignature(), scheme, clientRawPublicKey, hash, true)) {
+        PublicKey clientKey = clientCertificateTrustManager != null? clientCertificateChain.get(0).getPublicKey(): clientRawPublicKey;
+        if (!verifyCertificateVerify(certificateVerifyMessage.getSignature(), scheme, clientKey, hash, true)) {
             throw new DecryptErrorAlert("signature verification fails");
         }
-        if (!clientRawPublicKeyVerifier.test(clientRawPublicKey)) {
+        if (clientCertificateTrustManager != null) {
+            try {
+                clientCertificateTrustManager.checkClientTrusted(clientCertificateChain.toArray(new X509Certificate[0]), clientKey.getAlgorithm());
+            }
+            catch (CertificateException | RuntimeException rejected) {
+                clientCertificateChain = null;
+                throw new BadCertificateAlert("client certificate not accepted: " + rejected.getMessage());
+            }
+        }
+        else if (!clientRawPublicKeyVerifier.test(clientRawPublicKey)) {
             throw new CertificateUnknownAlert("raw public key not accepted");
         }
         transcriptHash.recordClient(certificateVerifyMessage);
@@ -671,7 +698,7 @@ public class TlsServerEngineImpl extends TlsEngineImpl implements TlsServerEngin
 
         status = Status.Connected;
 
-        if (sessionRegistry != null && clientSupportedKeyExchangeModes.contains(psk_dhe_ke) && clientRawPublicKeyVerifier == null) {  // Server only supports psk_dhe_ke
+        if (sessionRegistry != null && clientSupportedKeyExchangeModes.contains(psk_dhe_ke) && !clientAuthenticationRequired()) {  // Server only supports psk_dhe_ke
             NewSessionTicketMessage newSessionTicketMessage =
                     sessionRegistry.createNewSessionTicketMessage(currentTicketNumber++, selectedCipher, state, selectedApplicationLayerProtocol, maxEarlyDataSize, additionalSessionData);
             if (newSessionTicketMessage != null) {
@@ -767,6 +794,9 @@ public class TlsServerEngineImpl extends TlsEngineImpl implements TlsServerEngin
         if (signatureSchemes.isEmpty() || !signatureAlgorithmFactory.getSupportedSignatureSchemes().containsAll(signatureSchemes)) {
             throw new IllegalArgumentException("unsupported signature scheme(s): " + signatureSchemes);
         }
+        if (clientCertificateTrustManager != null) {
+            throw new IllegalStateException("client authentication with a certificate is already required");
+        }
         clientRawPublicKeyVerifier = Objects.requireNonNull(verifier);
         clientAuthSignatureSchemes = List.copyOf(signatureSchemes);
     }
@@ -774,6 +804,34 @@ public class TlsServerEngineImpl extends TlsEngineImpl implements TlsServerEngin
     @Override
     public PublicKey getClientRawPublicKey() {
         return clientRawPublicKey;
+    }
+
+    @Override
+    public void requireClientCertificate(X509TrustManager trustManager, List<SignatureScheme> signatureSchemes) {
+        if (status != Status.Start) {
+            throw new IllegalStateException("handshake already started");
+        }
+        if (clientRawPublicKeyVerifier != null) {
+            throw new IllegalStateException("client authentication with a raw public key is already required");
+        }
+        if (signatureSchemes.isEmpty() || !signatureAlgorithmFactory.getSupportedSignatureSchemes().containsAll(signatureSchemes)) {
+            throw new IllegalArgumentException("unsupported signature scheme(s): " + signatureSchemes);
+        }
+        clientCertificateTrustManager = Objects.requireNonNull(trustManager);
+        clientAuthSignatureSchemes = List.copyOf(signatureSchemes);
+    }
+
+    /**
+     * Resumed sessions skip client authentication, so with it required, sessions are neither resumed nor issued.
+     */
+    private boolean clientAuthenticationRequired() {
+        return clientRawPublicKeyVerifier != null || clientCertificateTrustManager != null;
+    }
+
+    @Override
+    public List<X509Certificate> getClientCertificateChain() {
+        // Only once accepted
+        return status == Status.WaitFinished || status == Status.Connected? clientCertificateChain: null;
     }
 }
 

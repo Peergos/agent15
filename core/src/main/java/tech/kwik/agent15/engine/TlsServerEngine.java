@@ -31,6 +31,8 @@ import java.util.List;
 import java.util.function.Function;
 import java.util.function.Predicate;
 import java.security.PublicKey;
+import java.security.cert.X509Certificate;
+import javax.net.ssl.X509TrustManager;
 
 public interface TlsServerEngine extends TlsEngine {
 
@@ -123,4 +125,19 @@ public interface TlsServerEngine extends TlsEngine {
      * @return  the raw public key the client authenticated with, or null when the client did not (yet) authenticate
      */
     PublicKey getClientRawPublicKey();
+
+    /**
+     * Requires the client to authenticate with an X.509 certificate. The server sends a CertificateRequest, checks the
+     * client's CertificateVerify with the end-entity certificate's key and then has the trust manager check the chain
+     * ({@link X509TrustManager#checkClientTrusted}); a chain it rejects fails the handshake with a bad_certificate
+     * alert. Not to be combined with {@link #requireClientRawPublicKey}.
+     * @param signatureSchemes  the signature schemes accepted for the client's certificate verify message
+     */
+    void requireClientCertificate(X509TrustManager trustManager, List<TlsConstants.SignatureScheme> signatureSchemes);
+
+    /**
+     * The certificate chain the client authenticated with, see {@link #requireClientCertificate}; null when there was
+     * none (yet).
+     */
+    List<X509Certificate> getClientCertificateChain();
 }

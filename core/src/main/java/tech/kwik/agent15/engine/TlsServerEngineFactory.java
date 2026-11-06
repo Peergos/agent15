@@ -71,6 +71,7 @@ public class TlsServerEngineFactory {
     private final PublicKey rawPublicKey;
     private Predicate<PublicKey> clientRawPublicKeyVerifier;
     private List<TlsConstants.SignatureScheme> clientAuthSignatureSchemes;
+    private javax.net.ssl.X509TrustManager clientCertificateTrustManager;
 
     /**
      * Creates a tls server engine factory, given an RSA certificate and its private key.
@@ -145,6 +146,19 @@ public class TlsServerEngineFactory {
         clientAuthSignatureSchemes = List.copyOf(signatureSchemes);
     }
 
+    /**
+     * Makes the engines created by this factory require client authentication with an X.509 certificate, see
+     * {@link TlsServerEngine#requireClientCertificate}.
+     */
+    public boolean requiresClientCertificate() {
+        return clientCertificateTrustManager != null;
+    }
+
+    public void requireClientCertificate(javax.net.ssl.X509TrustManager trustManager, List<TlsConstants.SignatureScheme> signatureSchemes) {
+        clientCertificateTrustManager = trustManager;
+        clientAuthSignatureSchemes = List.copyOf(signatureSchemes);
+    }
+
     private static List<X509Certificate> getCertificates(KeyStore keyStore, String alias) {
         try {
             Certificate[] certificates = keyStore.getCertificateChain(alias);
@@ -180,6 +194,9 @@ public class TlsServerEngineFactory {
                         serverMessageSender, tlsStatusHandler, tlsSessionRegistry, new KeyExchangeFactoryScanner(), new SignatureAlgorithmFactoryScanner());
         if (clientRawPublicKeyVerifier != null) {
             tlsServerEngine.requireClientRawPublicKey(clientRawPublicKeyVerifier, clientAuthSignatureSchemes);
+        }
+        if (clientCertificateTrustManager != null) {
+            tlsServerEngine.requireClientCertificate(clientCertificateTrustManager, clientAuthSignatureSchemes);
         }
         tlsServerEngine.addSupportedCiphers(List.of(TlsConstants.CipherSuite.TLS_AES_128_GCM_SHA256));
         return tlsServerEngine;
