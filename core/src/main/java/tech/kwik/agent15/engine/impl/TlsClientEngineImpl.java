@@ -249,8 +249,9 @@ public class TlsClientEngineImpl extends TlsEngineImpl implements TlsClientEngin
             state.computeEarlyTrafficSecret();
             statusHandler.earlySecretsKnown();
         }
-        sender.send(clientHello1);
+        // Before sending: the server hello can be processed on another thread before send returns
         status = Status.WaitServerHello;
+        sender.send(clientHello1);
     }
 
     /**
