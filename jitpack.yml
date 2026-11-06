@@ -1,0 +1,5 @@
+jdk:
+  - openjdk21
+install:
+  # Only the core module: kwik needs nothing else, and pqc needs Java 25
+  - ./gradlew -Pgroup=$GROUP.$ARTIFACT -Pversion=$VERSION -xtest :core:publishToMavenLocal

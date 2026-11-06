@@ -30,13 +30,18 @@ def determineVersion() {
     return versionTag
 }
 
+// JitPack gives the group and version (-Pgroup, -Pversion) and has no signing keys
+def jitpack = System.getenv('JITPACK') != null
+
 def versionTag = determineVersion()
-if (versionTag != null) {
+if (versionTag != null && !jitpack) {
     allprojects { it.version = versionTag }
 }
 
 allprojects {
-    group = 'tech.kwik'
+    if (!jitpack) {
+        group = 'tech.kwik'
+    }
 
     repositories {
         mavenCentral()
@@ -84,7 +89,9 @@ subprojects {
         configure(new JavaLibrary(new JavadocJar.Empty(), true))
 
         publishToMavenCentral()
-        signAllPublications()
+        if (project.findProperty('signingInMemoryKey') != null || project.findProperty('signing.keyId') != null) {
+            signAllPublications()
+        }
 
         pom {
             url = 'https://github.com/ptrd/agent15'
