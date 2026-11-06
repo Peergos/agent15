@@ -77,6 +77,8 @@ module tech.kwik.agent15 {
 
     requires at.favre.lib.hkdf;
     requires java.naming;
+    // Optional: faster X25519 and P-256 ECDSA when present, see engine.impl.BouncyCastleSupport
+    requires static org.bouncycastle.provider;
 
     // Key exchange groups that core does not implement itself (e.g. the hybrid groups provided by agent15-pqc).
     uses tech.kwik.agent15.engine.KeyExchangeFactory;

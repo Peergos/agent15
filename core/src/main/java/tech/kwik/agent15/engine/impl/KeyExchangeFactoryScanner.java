@@ -23,23 +23,35 @@ import tech.kwik.agent15.engine.KeyExchange;
 import tech.kwik.agent15.engine.KeyExchangeFactory;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.ServiceLoader;
+import java.util.WeakHashMap;
 
 public class KeyExchangeFactoryScanner implements KeyExchangeFactory {
 
-    private final Map<TlsConstants.NamedGroup, KeyExchangeFactory> keyExchangeFactories = new HashMap<>();
+    private final Map<TlsConstants.NamedGroup, KeyExchangeFactory> keyExchangeFactories;
+
+    // Scanning reads the class path (jar files), which is too costly to do for every handshake
+    private static final Map<ClassLoader, Map<TlsConstants.NamedGroup, KeyExchangeFactory>> SCANNED = Collections.synchronizedMap(new WeakHashMap<>());
 
     public KeyExchangeFactoryScanner() {
+        ClassLoader loader = Thread.currentThread().getContextClassLoader();
+        keyExchangeFactories = loader != null? SCANNED.computeIfAbsent(loader, l -> scan()): scan();
+    }
+
+    private static Map<TlsConstants.NamedGroup, KeyExchangeFactory> scan() {
+        Map<TlsConstants.NamedGroup, KeyExchangeFactory> factories = new HashMap<>();
         for (KeyExchangeFactory factory : ServiceLoader.load(KeyExchangeFactory.class)) {
             int priority = HandshakeFactoryRegistration.priority(factory);
             for (var group : factory.getSupportedGroups()) {
                 HandshakeFactoryRegistration.putIfHigherPriority(
-                        keyExchangeFactories, group, factory, priority, HandshakeFactoryRegistration::priority);
+                        factories, group, factory, priority, HandshakeFactoryRegistration::priority);
             }
         }
+        return Collections.unmodifiableMap(factories);
     }
 
     public KeyExchange forGroup(TlsConstants.NamedGroup group) {

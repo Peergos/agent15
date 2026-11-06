@@ -31,6 +31,9 @@ public class KeyExchangeFactoryImpl implements KeyExchangeFactory {
 
     @Override
     public KeyExchange forGroup(TlsConstants.NamedGroup group) {
+        if (group == x25519 && BouncyCastleSupport.AVAILABLE) {
+            return BouncyCastleSupport.x25519();
+        }
         if (group == x25519 || group == x448) {
             return new XDHKeyExchange(group);
         }

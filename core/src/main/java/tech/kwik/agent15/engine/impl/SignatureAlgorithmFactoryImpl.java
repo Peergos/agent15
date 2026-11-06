@@ -38,7 +38,7 @@ public class SignatureAlgorithmFactoryImpl implements SignatureAlgorithmFactory 
             case rsa_pss_rsae_sha512:
                 return new RsaPssRsaeSha512();
             case ecdsa_secp256r1_sha256:
-                return new EcdsaSecp256r1Sha256();
+                return BouncyCastleSupport.AVAILABLE? BouncyCastleSupport.ecdsaSecp256r1Sha256(): new EcdsaSecp256r1Sha256();
             case ecdsa_secp384r1_sha384:
                 return new EcdsaSecp384r1Sha384();
             case ecdsa_secp521r1_sha512:

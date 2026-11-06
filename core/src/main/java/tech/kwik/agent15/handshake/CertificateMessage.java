@@ -218,23 +218,80 @@ public class CertificateMessage extends HandshakeMessage {
         }
     }
 
-    private static final List<String> RAW_PUBLIC_KEY_ALGORITHMS = List.of("Ed25519", "Ed448", "EC", "RSA");
-
     static Optional<PublicKey> decodeSubjectPublicKeyInfo(byte[] data) {
-        X509EncodedKeySpec keySpec = new X509EncodedKeySpec(data);
-        for (String algorithm : RAW_PUBLIC_KEY_ALGORITHMS) {
-            try {
-                PublicKey key = KeyFactory.getInstance(algorithm).generatePublic(keySpec);
-                // Guard against lenient decoders that ignore trailing data.
-                if (java.util.Arrays.equals(key.getEncoded(), data)) {
-                    return Optional.of(key);
-                }
-            }
-            catch (NoSuchAlgorithmException | InvalidKeySpecException | ClassCastException | IllegalArgumentException e) {
-                // Not this algorithm, try the next one.
+        // Checked first, because trying the key factories on an X.509 certificate makes each of them throw
+        Optional<String> algorithm = subjectPublicKeyInfoAlgorithm(data);
+        if (algorithm.isEmpty()) {
+            return Optional.empty();
+        }
+        try {
+            PublicKey key = KeyFactory.getInstance(algorithm.get()).generatePublic(new X509EncodedKeySpec(data));
+            // Guard against lenient decoders that ignore trailing data.
+            if (java.util.Arrays.equals(key.getEncoded(), data)) {
+                return Optional.of(key);
             }
         }
+        catch (NoSuchAlgorithmException | InvalidKeySpecException | ClassCastException | IllegalArgumentException e) {
+            // Not a valid key of this algorithm
+        }
         return Optional.empty();
+    }
+
+    private static final byte[] OID_ED25519 = { 0x2b, 0x65, 0x70 };
+    private static final byte[] OID_ED448 = { 0x2b, 0x65, 0x71 };
+    private static final byte[] OID_EC_PUBLIC_KEY = { 0x2a, (byte) 0x86, 0x48, (byte) 0xce, 0x3d, 0x02, 0x01 };
+    private static final byte[] OID_RSA_ENCRYPTION = { 0x2a, (byte) 0x86, 0x48, (byte) 0x86, (byte) 0xf7, 0x0d, 0x01, 0x01, 0x01 };
+
+    /**
+     * The key algorithm of a DER-encoded SubjectPublicKeyInfo, i.e. SEQUENCE { SEQUENCE { OID algorithm, ... }, BIT STRING },
+     * or empty when data is not one, e.g. because it is an X.509 certificate: there, the inner SEQUENCE (the
+     * TBSCertificate) starts with the version ([0]) or the serial number (INTEGER), not an OID.
+     */
+    static Optional<String> subjectPublicKeyInfoAlgorithm(byte[] data) {
+        try {
+            ByteBuffer der = ByteBuffer.wrap(data);
+            if (der.get() != 0x30) {
+                return Optional.empty();
+            }
+            skipDerLength(der);
+            if (der.get() != 0x30) {
+                return Optional.empty();
+            }
+            skipDerLength(der);
+            if (der.get() != 0x06) {
+                return Optional.empty();
+            }
+            int oidLength = der.get() & 0xff;
+            if (oidLength > 0x7f || oidLength > der.remaining()) {
+                return Optional.empty();
+            }
+            byte[] oid = new byte[oidLength];
+            der.get(oid);
+            if (java.util.Arrays.equals(oid, OID_ED25519)) {
+                return Optional.of("Ed25519");
+            }
+            if (java.util.Arrays.equals(oid, OID_ED448)) {
+                return Optional.of("Ed448");
+            }
+            if (java.util.Arrays.equals(oid, OID_EC_PUBLIC_KEY)) {
+                return Optional.of("EC");
+            }
+            if (java.util.Arrays.equals(oid, OID_RSA_ENCRYPTION)) {
+                return Optional.of("RSA");
+            }
+            return Optional.empty();
+        }
+        catch (BufferUnderflowException | IllegalArgumentException malformed) {
+            return Optional.empty();
+        }
+    }
+
+    private static void skipDerLength(ByteBuffer der) {
+        int first = der.get() & 0xff;
+        if (first > 0x80) {
+            // Long form: the number of length bytes follows
+            der.position(der.position() + (first & 0x7f));
+        }
     }
 
     private static List<byte[]> encode(List<X509Certificate> certificateChain) {

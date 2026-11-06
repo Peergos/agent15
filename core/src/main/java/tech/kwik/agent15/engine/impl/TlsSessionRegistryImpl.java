@@ -46,6 +46,8 @@ public class TlsSessionRegistryImpl implements TlsSessionRegistry {
     private int ticketLifeTimeInSeconds;
     private volatile boolean closed;
     private static final long CLEANUP_INTERVAL_NANOS = TimeUnit.MINUTES.toNanos(1);
+    // When full, cleaning up often frees space sooner, but each cleanup scans all sessions
+    private static final long FULL_CLEANUP_INTERVAL_NANOS = TimeUnit.SECONDS.toNanos(1);
     // Expired sessions are removed when tickets are created, rather than by a thread of the registry's own
     private volatile long lastCleanup = System.nanoTime();
     private final int maxRegistrySize;
@@ -67,7 +69,8 @@ public class TlsSessionRegistryImpl implements TlsSessionRegistry {
     @Override
     public NewSessionTicketMessage createNewSessionTicketMessage(byte ticketNonce, TlsConstants.CipherSuite cipher, TlsState tlsState, String applicationProtocol, Long maxEarlyDataSize, byte[] data) {
         long now = System.nanoTime();
-        if (now - lastCleanup >= CLEANUP_INTERVAL_NANOS || full()) {
+        long sinceCleanup = now - lastCleanup;
+        if (sinceCleanup >= CLEANUP_INTERVAL_NANOS || full() && sinceCleanup >= FULL_CLEANUP_INTERVAL_NANOS) {
             lastCleanup = now;
             cleanupExpiredPsks();
         }
