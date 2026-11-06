@@ -31,8 +31,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.Random;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
@@ -47,7 +45,9 @@ public class TlsSessionRegistryImpl implements TlsSessionRegistry {
     private Map<BytesKey, Session> sessions = new ConcurrentHashMap<>();
     private int ticketLifeTimeInSeconds;
     private volatile boolean closed;
-    private ScheduledExecutorService scheduledExecutorService;
+    private static final long CLEANUP_INTERVAL_NANOS = TimeUnit.MINUTES.toNanos(1);
+    // Expired sessions are removed when tickets are created, rather than by a thread of the registry's own
+    private volatile long lastCleanup = System.nanoTime();
     private final int maxRegistrySize;
 
     public TlsSessionRegistryImpl() {
@@ -57,8 +57,6 @@ public class TlsSessionRegistryImpl implements TlsSessionRegistry {
     public TlsSessionRegistryImpl(int ticketLifeTimeInSeconds, int maxSize) {
         this.ticketLifeTimeInSeconds = ticketLifeTimeInSeconds;
         this.maxRegistrySize = maxSize;
-        scheduledExecutorService = Executors.newSingleThreadScheduledExecutor();
-        scheduledExecutorService.scheduleAtFixedRate(this::cleanupExpiredPsks, 1, 1, TimeUnit.MINUTES);
     }
 
     @Override
@@ -68,6 +66,11 @@ public class TlsSessionRegistryImpl implements TlsSessionRegistry {
 
     @Override
     public NewSessionTicketMessage createNewSessionTicketMessage(byte ticketNonce, TlsConstants.CipherSuite cipher, TlsState tlsState, String applicationProtocol, Long maxEarlyDataSize, byte[] data) {
+        long now = System.nanoTime();
+        if (now - lastCleanup >= CLEANUP_INTERVAL_NANOS || full()) {
+            lastCleanup = now;
+            cleanupExpiredPsks();
+        }
         if (! closed && !full()) {
             byte[] psk = tlsState.computePSK(new byte[]{ticketNonce});
             long ageAdd = randomGenerator.nextLong();
@@ -127,7 +130,6 @@ public class TlsSessionRegistryImpl implements TlsSessionRegistry {
     @Override
     public void shutdown() {
         closed = true;
-        scheduledExecutorService.shutdown();
         sessions.clear();
     }
 
